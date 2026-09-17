@@ -1,0 +1,25 @@
+name: Hyperlapse
+options:
+  bundleIdPrefix: com.hyperlapse
+targets:
+  Hyperlapse:
+    type: application
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - Sources
+    settings:
+      CODE_SIGNING_ALLOWED: NO
+      CODE_SIGNING_REQUIRED: NO
+      CODE_SIGN_IDENTITY: ""
+    info:
+      properties:
+        CFBundleDisplayName: "Hyperlapse"
+        CFBundleIdentifier: "com.hyperlapse.app"
+        CFBundleShortVersionString: "1.0"
+        CFBundleVersion: "1"
+        UILaunchScreen: {}
+        NSCameraUsageDescription: "Camera access is needed to record stabilized hyperlapse videos."
+        NSPhotoLibraryAddUsageDescription: "Save videos to Photos."
+        NSPhotoLibraryUsageDescription: "Save videos to Photos."
+        NSMicrophoneUsageDescription: "Record audio."
