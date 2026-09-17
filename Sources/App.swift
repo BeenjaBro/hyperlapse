@@ -2,23 +2,32 @@ import SwiftUI
 import AVFoundation
 import AudioToolbox
 import Photos
+import UIKit
 
 // MARK: - Bulletproof System Haptic Helper
 enum AppHaptics {
     static func tick() {
-        AudioServicesPlaySystemSound(1519) // Native iOS selection tick
+        AudioServicesPlaySystemSound(1519)
     }
     static func tap() {
-        AudioServicesPlaySystemSound(1520) // Native iOS medium impact
+        AudioServicesPlaySystemSound(1520)
     }
 }
 
 @main
 struct HyperlapseApp: App {
+    init() {
+        // Prevent screen dimming and auto-lock across the entire app
+        UIApplication.shared.isIdleTimerDisabled = true
+    }
+
     var body: some Scene {
         WindowGroup {
             MainView()
                 .preferredColorScheme(.dark)
+                .onAppear {
+                    UIApplication.shared.isIdleTimerDisabled = true
+                }
         }
     }
 }
@@ -58,19 +67,19 @@ struct CameraView: View {
                 .ignoresSafeArea()
 
             VStack {
-                // Active Stabilization Status Badge
+                // Live Hardware Stabilization Status Badge
                 HStack {
                     HStack(spacing: 6) {
                         Circle()
-                            .fill(camera.isStabilized ? Color.green : Color.yellow)
+                            .fill(camera.stabilizationStatusText.contains("OFF") ? Color.red : Color.green)
                             .frame(width: 8, height: 8)
-                        Text(camera.isStabilized ? "STABILIZATION: ACTIVE" : "STABILIZATION: STANDARD")
+                        Text(camera.stabilizationStatusText)
                             .font(.system(size: 11, weight: .bold, design: .monospaced))
                             .foregroundColor(.white)
                     }
                     .padding(.horizontal, 12)
                     .padding(.vertical, 6)
-                    .background(Color.black.opacity(0.55))
+                    .background(Color.black.opacity(0.65))
                     .clipShape(Capsule())
                     
                     Spacer()
@@ -175,12 +184,13 @@ struct CameraPreview: UIViewRepresentable {
 
 class CameraController: NSObject, ObservableObject, AVCaptureFileOutputRecordingDelegate {
     @Published var isRecording = false
-    @Published var isStabilized = false
+    @Published var stabilizationStatusText = "STABILIZATION: CHECKING..."
     @Published var recordingDuration: Double = 0
 
     let session = AVCaptureSession()
     private let movieOutput = AVCaptureMovieFileOutput()
     private var currentPosition: AVCaptureDevice.Position = .back
+    private var activeDevice: AVCaptureDevice?
     private var activeVideoInput: AVCaptureDeviceInput?
     private var recordCompletion: ((URL) -> Void)?
     private let sessionQueue = DispatchQueue(label: "camera.session.queue")
@@ -202,9 +212,9 @@ class CameraController: NSObject, ObservableObject, AVCaptureFileOutputRecording
     private func setupSession() {
         session.beginConfiguration()
         
-        // 1080p is required for max gyro overscan and cinematicExtended mode
-        if session.canSetSessionPreset(.hd1920x1080) {
-            session.sessionPreset = .hd1920x1080
+        // Use input priority so we can configure activeFormat directly for full gyro overscan
+        if session.canSetSessionPreset(.inputPriority) {
+            session.sessionPreset = .inputPriority
         }
 
         setupVideoInput(position: currentPosition)
@@ -226,8 +236,48 @@ class CameraController: NSObject, ObservableObject, AVCaptureFileOutputRecording
               let input = try? AVCaptureDeviceInput(device: device),
               session.canAddInput(input) else { return }
 
+        // Find 1080p 30fps format that supports cinematicExtended or cinematic
+        var targetFormat: AVCaptureDevice.Format? = nil
+        for format in device.formats {
+            let dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+            if dims.width == 1920 && dims.height == 1080 {
+                let supports30 = format.videoSupportedFrameRateRanges.contains { $0.minFrameRate <= 30 && $0.maxFrameRate >= 30 }
+                if supports30 && format.isVideoStabilizationModeSupported(.cinematicExtended) {
+                    targetFormat = format
+                    break
+                }
+            }
+        }
+
+        if targetFormat == nil {
+            for format in device.formats {
+                let dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+                if dims.width == 1920 && dims.height == 1080 {
+                    let supports30 = format.videoSupportedFrameRateRanges.contains { $0.minFrameRate <= 30 && $0.maxFrameRate >= 30 }
+                    if supports30 && format.isVideoStabilizationModeSupported(.cinematic) {
+                        targetFormat = format
+                        break
+                    }
+                }
+            }
+        }
+
+        do {
+            try device.lockForConfiguration()
+            if let target = targetFormat {
+                device.activeFormat = target
+            }
+            // Lock constant 30 FPS to eliminate speed variations
+            device.activeVideoMinFrameDuration = CMTime(value: 1, timescale: 30)
+            device.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: 30)
+            device.unlockForConfiguration()
+        } catch {
+            print("Device configuration error: \(error)")
+        }
+
         session.addInput(input)
         activeVideoInput = input
+        activeDevice = device
         currentPosition = position
     }
 
@@ -248,9 +298,37 @@ class CameraController: NSObject, ObservableObject, AVCaptureFileOutputRecording
         }
 
         if connection.isVideoStabilizationSupported {
-            connection.preferredVideoStabilizationMode = .cinematicExtended
-            DispatchQueue.main.async {
-                self.isStabilized = true
+            if let device = activeDevice, device.activeFormat.isVideoStabilizationModeSupported(.cinematicExtended) {
+                connection.preferredVideoStabilizationMode = .cinematicExtended
+            } else if let device = activeDevice, device.activeFormat.isVideoStabilizationModeSupported(.cinematic) {
+                connection.preferredVideoStabilizationMode = .cinematic
+            } else {
+                connection.preferredVideoStabilizationMode = .standard
+            }
+        }
+        
+        updateStabilizationStatus()
+    }
+
+    private func updateStabilizationStatus() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            guard let connection = self.movieOutput.connection(with: .video) else {
+                self.stabilizationStatusText = "STABILIZATION: NONE"
+                return
+            }
+            switch connection.activeVideoStabilizationMode {
+            case .off:
+                self.stabilizationStatusText = "STABILIZATION: OFF"
+            case .standard:
+                self.stabilizationStatusText = "STABILIZATION: STANDARD"
+            case .cinematic:
+                self.stabilizationStatusText = "STABILIZATION: CINEMATIC"
+            case .cinematicExtended:
+                self.stabilizationStatusText = "STABILIZATION: EXTENDED"
+            case .previewOptimized:
+                self.stabilizationStatusText = "STABILIZATION: PREVIEW"
+            @unknown default:
+                self.stabilizationStatusText = "STABILIZATION: ACTIVE"
             }
         }
     }
@@ -260,6 +338,7 @@ class CameraController: NSObject, ObservableObject, AVCaptureFileOutputRecording
             if !self.session.isRunning {
                 self.session.startRunning()
             }
+            self.updateStabilizationStatus()
         }
     }
 
@@ -449,6 +528,24 @@ struct PreviewView: View {
                 compVideoTrack.preferredTransform = transform
                 compVideoTrack.scaleTimeRange(timeRange, toDuration: targetDuration)
 
+                // Force steady 30 FPS sampling on export
+                let naturalSize = try await videoTrack.load(.naturalSize)
+                let isRotated = (transform.a == 0 && abs(transform.b) == 1.0) || (transform.d == 0 && abs(transform.c) == 1.0)
+                let renderWidth = isRotated ? naturalSize.height : naturalSize.width
+                let renderHeight = isRotated ? naturalSize.width : naturalSize.height
+
+                let videoComposition = AVMutableVideoComposition()
+                videoComposition.renderSize = CGSize(width: renderWidth, height: renderHeight)
+                videoComposition.frameDuration = CMTime(value: 1, timescale: 30)
+
+                let instruction = AVMutableVideoCompositionInstruction()
+                instruction.timeRange = CMTimeRange(start: .zero, duration: targetDuration)
+
+                let layerInstruction = AVMutableVideoCompositionLayerInstruction(assetTrack: compVideoTrack)
+                layerInstruction.setTransform(transform, at: .zero)
+                instruction.layerInstructions = [layerInstruction]
+                videoComposition.instructions = [instruction]
+
                 let outputURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".mp4")
                 guard let session = AVAssetExportSession(asset: composition, presetName: AVAssetExportPresetHighestQuality) else {
                     DispatchQueue.main.async { isExporting = false }
@@ -456,6 +553,7 @@ struct PreviewView: View {
                 }
                 session.outputURL = outputURL
                 session.outputFileType = .mp4
+                session.videoComposition = videoComposition
 
                 await withCheckedContinuation { continuation in
                     session.exportAsynchronously {
