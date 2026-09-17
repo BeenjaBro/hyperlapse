@@ -7,7 +7,7 @@ targets:
     platform: iOS
     deploymentTarget: "17.0"
     sources:
-      - Sources
+      - path: Sources
     settings:
       CODE_SIGNING_ALLOWED: NO
       CODE_SIGNING_REQUIRED: NO
