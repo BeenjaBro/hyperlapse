@@ -151,18 +151,12 @@ class CameraController: NSObject, ObservableObject, AVCaptureFileOutputRecording
     func configureStabilization() {
         guard let connection = movieOutput.connection(with: .video) else { return }
         
-        if connection.isVideoRotationAngleSupported(90) {
-            connection.videoRotationAngle = 90
-        } else if connection.isVideoOrientationSupported {
+        if connection.isVideoOrientationSupported {
             connection.videoOrientation = .portrait
         }
 
         if connection.isVideoStabilizationSupported {
-            if #available(iOS 18.0, *) {
-                connection.preferredVideoStabilizationMode = .cinematicExtendedEnhanced
-            } else {
-                connection.preferredVideoStabilizationMode = .cinematicExtended
-            }
+            connection.preferredVideoStabilizationMode = .cinematicExtended
         }
     }
 
@@ -241,7 +235,6 @@ struct PreviewView: View {
 
             VStack {
                 HStack {
-                    // Discard
                     Button(action: onDismiss) {
                         Image(systemName: "xmark")
                             .font(.system(size: 18, weight: .bold))
@@ -251,7 +244,6 @@ struct PreviewView: View {
                             .clipShape(Circle())
                     }
                     Spacer()
-                    // Save
                     Button(action: exportAndSave) {
                         Image(systemName: "checkmark")
                             .font(.system(size: 18, weight: .bold))
@@ -266,7 +258,6 @@ struct PreviewView: View {
 
                 Spacer()
 
-                // Time readout
                 HStack(spacing: 10) {
                     Text(formatTime(originalDuration))
                         .font(.system(size: 15, weight: .medium, design: .monospaced))
@@ -279,7 +270,6 @@ struct PreviewView: View {
                 .foregroundColor(.white)
                 .padding(.bottom, 14)
 
-                // Speed Slider
                 HStack {
                     ForEach(0..<speeds.count, id: \.self) { index in
                         Button(action: {
@@ -390,7 +380,11 @@ struct PreviewView: View {
                 session.outputURL = outputURL
                 session.outputFileType = .mp4
 
-                await session.export()
+                await withCheckedContinuation { continuation in
+                    session.exportAsynchronously {
+                        continuation.resume()
+                    }
+                }
 
                 if session.status == .completed {
                     try await PHPhotoLibrary.shared().performChanges {
