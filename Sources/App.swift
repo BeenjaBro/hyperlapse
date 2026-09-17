@@ -3,6 +3,35 @@ import AVFoundation
 import Photos
 import UIKit
 
+// MARK: - Persistent Haptic Engine
+class Haptics {
+    static let shared = Haptics()
+    private let selection = UISelectionFeedbackGenerator()
+    private let impact = UIImpactFeedbackGenerator(style: .medium)
+    private let light = UIImpactFeedbackGenerator(style: .light)
+
+    init() {
+        selection.prepare()
+        impact.prepare()
+        light.prepare()
+    }
+
+    func tick() {
+        selection.selectionChanged()
+        selection.prepare()
+    }
+
+    func tap() {
+        impact.impactOccurred()
+        impact.prepare()
+    }
+
+    func lightTap() {
+        light.impactOccurred()
+        light.prepare()
+    }
+}
+
 @main
 struct HyperlapseApp: App {
     var body: some Scene {
@@ -42,9 +71,6 @@ struct CameraView: View {
     @ObservedObject var camera: CameraController
     var onFinishRecording: (URL) -> Void
 
-    private let impactMed = UIImpactFeedbackGenerator(style: .medium)
-    private let impactLight = UIImpactFeedbackGenerator(style: .light)
-
     var body: some View {
         ZStack {
             CameraPreview(session: camera.session)
@@ -52,10 +78,23 @@ struct CameraView: View {
 
             VStack {
                 Spacer()
+
+                // Live recording time elapsed indicator
+                if camera.isRecording {
+                    Text(formatTime(camera.recordingDuration))
+                        .font(.system(size: 15, weight: .semibold, design: .monospaced))
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 6)
+                        .background(Color.red.opacity(0.85))
+                        .clipShape(Capsule())
+                        .padding(.bottom, 12)
+                }
+
                 HStack {
                     Spacer()
                     Button(action: {
-                        impactMed.impactOccurred()
+                        Haptics.shared.tap()
                         if camera.isRecording {
                             camera.stopRecording(completion: onFinishRecording)
                         } else {
@@ -83,7 +122,7 @@ struct CameraView: View {
                 .overlay(alignment: .trailing) {
                     if !camera.isRecording {
                         Button(action: {
-                            impactLight.impactOccurred()
+                            Haptics.shared.lightTap()
                             camera.switchCamera()
                         }) {
                             Image(systemName: "arrow.triangle.2.circlepath")
@@ -100,10 +139,14 @@ struct CameraView: View {
             }
         }
         .onAppear {
-            impactMed.prepare()
-            impactLight.prepare()
             camera.checkPermissions()
         }
+    }
+
+    private func formatTime(_ seconds: Double) -> String {
+        let mins = Int(seconds) / 60
+        let secs = Int(seconds) % 60
+        return String(format: "%02d:%02d", mins, secs)
     }
 }
 
@@ -131,6 +174,8 @@ struct CameraPreview: UIViewRepresentable {
 
 class CameraController: NSObject, ObservableObject, AVCaptureFileOutputRecordingDelegate {
     @Published var isRecording = false
+    @Published var recordingDuration: Double = 0
+
     let session = AVCaptureSession()
     private let movieOutput = AVCaptureMovieFileOutput()
     private var currentPosition: AVCaptureDevice.Position = .back
@@ -138,6 +183,7 @@ class CameraController: NSObject, ObservableObject, AVCaptureFileOutputRecording
     private var activeAudioInput: AVCaptureDeviceInput?
     private var recordCompletion: ((URL) -> Void)?
     private let sessionQueue = DispatchQueue(label: "camera.session.queue")
+    private var timer: Timer?
 
     func checkPermissions() {
         sessionQueue.async {
@@ -168,6 +214,14 @@ class CameraController: NSObject, ObservableObject, AVCaptureFileOutputRecording
     }
 
     private func setupSession() {
+        do {
+            let audioSession = AVAudioSession.sharedInstance()
+            try audioSession.setCategory(.playAndRecord, mode: .videoRecording, options: [.defaultToSpeaker, .allowBluetooth])
+            try audioSession.setActive(true)
+        } catch {
+            print("Audio session configuration error: \(error)")
+        }
+
         session.beginConfiguration()
         session.sessionPreset = .high
 
@@ -236,13 +290,26 @@ class CameraController: NSObject, ObservableObject, AVCaptureFileOutputRecording
         configureStabilization()
         let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".mov")
         movieOutput.startRecording(to: tempURL, recordingDelegate: self)
-        DispatchQueue.main.async { self.isRecording = true }
+
+        DispatchQueue.main.async {
+            self.isRecording = true
+            self.recordingDuration = 0
+            self.timer?.invalidate()
+            self.timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+                self?.recordingDuration += 1
+            }
+        }
     }
 
     func stopRecording(completion: @escaping (URL) -> Void) {
         recordCompletion = completion
         movieOutput.stopRecording()
-        DispatchQueue.main.async { self.isRecording = false }
+
+        DispatchQueue.main.async {
+            self.isRecording = false
+            self.timer?.invalidate()
+            self.timer = nil
+        }
     }
 
     func fileOutput(_ output: AVCaptureFileOutput, didFinishRecordingTo outputFileURL: URL, from connections: [AVCaptureConnection], error: Error?) {
@@ -263,9 +330,6 @@ struct PreviewView: View {
     @State private var originalDuration: Double = 0
     @State private var isExporting = false
 
-    private let impactMed = UIImpactFeedbackGenerator(style: .medium)
-    private let notifyFeedback = UINotificationFeedbackGenerator()
-
     var currentSpeed: Double { speeds[selectedIndex] }
     var adjustedDuration: Double {
         guard currentSpeed > 0 else { return originalDuration }
@@ -284,7 +348,7 @@ struct PreviewView: View {
             VStack {
                 HStack {
                     Button(action: {
-                        impactMed.impactOccurred()
+                        Haptics.shared.tap()
                         onDismiss()
                     }) {
                         Image(systemName: "xmark")
@@ -296,7 +360,7 @@ struct PreviewView: View {
                     }
                     Spacer()
                     Button(action: {
-                        notifyFeedback.notificationOccurred(.success)
+                        Haptics.shared.tap()
                         exportAndSave()
                     }) {
                         Image(systemName: "checkmark")
@@ -345,11 +409,7 @@ struct PreviewView: View {
             }
         }
         .onAppear {
-            impactMed.prepare()
-            notifyFeedback.prepare()
-
             let p = AVPlayer(url: videoURL)
-            p.isMuted = true
             self.player = p
 
             let asset = AVAsset(url: videoURL)
@@ -391,20 +451,27 @@ struct PreviewView: View {
             do {
                 let composition = AVMutableComposition()
                 guard let videoTrack = try await asset.loadTracks(withMediaType: .video).first,
-                      let compTrack = composition.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid) else {
+                      let compVideoTrack = composition.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid) else {
                     DispatchQueue.main.async { isExporting = false }
                     return
                 }
 
                 let duration = try await asset.load(.duration)
                 let timeRange = CMTimeRange(start: .zero, duration: duration)
-                try compTrack.insertTimeRange(timeRange, of: videoTrack, at: .zero)
-
-                let transform = try await videoTrack.load(.preferredTransform)
-                compTrack.preferredTransform = transform
-
                 let targetDuration = CMTime(value: Int64(Double(duration.value) / speed), timescale: duration.timescale)
-                compTrack.scaleTimeRange(timeRange, toDuration: targetDuration)
+
+                // Insert & scale video track
+                try compVideoTrack.insertTimeRange(timeRange, of: videoTrack, at: .zero)
+                let transform = try await videoTrack.load(.preferredTransform)
+                compVideoTrack.preferredTransform = transform
+                compVideoTrack.scaleTimeRange(timeRange, toDuration: targetDuration)
+
+                // Insert & scale audio track
+                if let audioTrack = try? await asset.loadTracks(withMediaType: .audio).first,
+                   let compAudioTrack = composition.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid) {
+                    try? compAudioTrack.insertTimeRange(timeRange, of: audioTrack, at: .zero)
+                    compAudioTrack.scaleTimeRange(timeRange, toDuration: targetDuration)
+                }
 
                 let outputURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".mp4")
                 guard let session = AVAssetExportSession(asset: composition, presetName: AVAssetExportPresetHighestQuality) else {
@@ -443,12 +510,10 @@ struct DraggableSpeedSlider: View {
     @Binding var selectedIndex: Int
     var onSpeedChanged: (Double) -> Void
 
-    private let selectionFeedback = UISelectionFeedbackGenerator()
-
     var body: some View {
         GeometryReader { geometry in
             let totalWidth = geometry.size.width
-            let padding: CGFloat = 26
+            let padding: CGFloat = 30
             let usableWidth = totalWidth - (padding * 2)
             let step = usableWidth / CGFloat(max(1, speeds.count - 1))
             let thumbX = padding + (CGFloat(selectedIndex) * step)
@@ -457,18 +522,15 @@ struct DraggableSpeedSlider: View {
                 Capsule()
                     .fill(Color.black.opacity(0.6))
 
-                // Markers
-                HStack(spacing: 0) {
-                    ForEach(0..<speeds.count, id: \.self) { i in
-                        Circle()
-                            .fill(Color.white.opacity(0.35))
-                            .frame(width: 6, height: 6)
-                            .frame(maxWidth: .infinity)
-                    }
+                // Translucent dots placed with exact matching coordinate steps
+                ForEach(0..<speeds.count, id: \.self) { i in
+                    Circle()
+                        .fill(Color.white.opacity(0.35))
+                        .frame(width: 6, height: 6)
+                        .position(x: padding + (CGFloat(i) * step), y: geometry.size.height / 2)
                 }
-                .padding(.horizontal, padding)
 
-                // Drag Thumb Indicator
+                // Speed Thumb
                 Circle()
                     .fill(Color.white)
                     .frame(width: 44, height: 44)
@@ -489,7 +551,7 @@ struct DraggableSpeedSlider: View {
                         let newIndex = Int(round(fraction * CGFloat(speeds.count - 1)))
                         if newIndex != selectedIndex && newIndex >= 0 && newIndex < speeds.count {
                             selectedIndex = newIndex
-                            selectionFeedback.selectionChanged()
+                            Haptics.shared.tick()
                             onSpeedChanged(speeds[newIndex])
                         }
                     }
@@ -497,9 +559,6 @@ struct DraggableSpeedSlider: View {
         }
         .frame(height: 54)
         .padding(.horizontal, 20)
-        .onAppear {
-            selectionFeedback.prepare()
-        }
     }
 }
 
