@@ -1,34 +1,15 @@
 import SwiftUI
 import AVFoundation
+import AudioToolbox
 import Photos
-import UIKit
 
-// MARK: - Persistent Haptic Engine
-class Haptics {
-    static let shared = Haptics()
-    private let selection = UISelectionFeedbackGenerator()
-    private let impact = UIImpactFeedbackGenerator(style: .medium)
-    private let light = UIImpactFeedbackGenerator(style: .light)
-
-    init() {
-        selection.prepare()
-        impact.prepare()
-        light.prepare()
+// MARK: - Bulletproof System Haptic Helper
+enum AppHaptics {
+    static func tick() {
+        AudioServicesPlaySystemSound(1519) // Native iOS selection tick
     }
-
-    func tick() {
-        selection.selectionChanged()
-        selection.prepare()
-    }
-
-    func tap() {
-        impact.impactOccurred()
-        impact.prepare()
-    }
-
-    func lightTap() {
-        light.impactOccurred()
-        light.prepare()
+    static func tap() {
+        AudioServicesPlaySystemSound(1520) // Native iOS medium impact
     }
 }
 
@@ -77,12 +58,32 @@ struct CameraView: View {
                 .ignoresSafeArea()
 
             VStack {
+                // Active Stabilization Status Badge
+                HStack {
+                    HStack(spacing: 6) {
+                        Circle()
+                            .fill(camera.isStabilized ? Color.green : Color.yellow)
+                            .frame(width: 8, height: 8)
+                        Text(camera.isStabilized ? "STABILIZATION: ACTIVE" : "STABILIZATION: STANDARD")
+                            .font(.system(size: 11, weight: .bold, design: .monospaced))
+                            .foregroundColor(.white)
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(Color.black.opacity(0.55))
+                    .clipShape(Capsule())
+                    
+                    Spacer()
+                }
+                .padding(.top, 50)
+                .padding(.leading, 20)
+
                 Spacer()
 
-                // Live recording time elapsed indicator
+                // Live recording time elapsed
                 if camera.isRecording {
                     Text(formatTime(camera.recordingDuration))
-                        .font(.system(size: 15, weight: .semibold, design: .monospaced))
+                        .font(.system(size: 15, weight: .bold, design: .monospaced))
                         .foregroundColor(.white)
                         .padding(.horizontal, 14)
                         .padding(.vertical, 6)
@@ -94,7 +95,7 @@ struct CameraView: View {
                 HStack {
                     Spacer()
                     Button(action: {
-                        Haptics.shared.tap()
+                        AppHaptics.tap()
                         if camera.isRecording {
                             camera.stopRecording(completion: onFinishRecording)
                         } else {
@@ -122,7 +123,7 @@ struct CameraView: View {
                 .overlay(alignment: .trailing) {
                     if !camera.isRecording {
                         Button(action: {
-                            Haptics.shared.lightTap()
+                            AppHaptics.tap()
                             camera.switchCamera()
                         }) {
                             Image(systemName: "arrow.triangle.2.circlepath")
@@ -174,64 +175,45 @@ struct CameraPreview: UIViewRepresentable {
 
 class CameraController: NSObject, ObservableObject, AVCaptureFileOutputRecordingDelegate {
     @Published var isRecording = false
+    @Published var isStabilized = false
     @Published var recordingDuration: Double = 0
 
     let session = AVCaptureSession()
     private let movieOutput = AVCaptureMovieFileOutput()
     private var currentPosition: AVCaptureDevice.Position = .back
     private var activeVideoInput: AVCaptureDeviceInput?
-    private var activeAudioInput: AVCaptureDeviceInput?
     private var recordCompletion: ((URL) -> Void)?
     private let sessionQueue = DispatchQueue(label: "camera.session.queue")
     private var timer: Timer?
 
     func checkPermissions() {
         sessionQueue.async {
-            self.requestPermissionsAndSetup()
-        }
-    }
-
-    private func requestPermissionsAndSetup() {
-        let videoStatus = AVCaptureDevice.authorizationStatus(for: .video)
-        if videoStatus == .notDetermined {
-            AVCaptureDevice.requestAccess(for: .video) { granted in
-                if granted { self.requestAudioAndSetup() }
+            let status = AVCaptureDevice.authorizationStatus(for: .video)
+            if status == .notDetermined {
+                AVCaptureDevice.requestAccess(for: .video) { granted in
+                    if granted { self.setupSession() }
+                }
+            } else if status == .authorized {
+                self.setupSession()
             }
-        } else if videoStatus == .authorized {
-            requestAudioAndSetup()
-        }
-    }
-
-    private func requestAudioAndSetup() {
-        let audioStatus = AVCaptureDevice.authorizationStatus(for: .audio)
-        if audioStatus == .notDetermined {
-            AVCaptureDevice.requestAccess(for: .audio) { _ in
-                self.sessionQueue.async { self.setupSession() }
-            }
-        } else {
-            sessionQueue.async { self.setupSession() }
         }
     }
 
     private func setupSession() {
-        do {
-            let audioSession = AVAudioSession.sharedInstance()
-            try audioSession.setCategory(.playAndRecord, mode: .videoRecording, options: [.defaultToSpeaker, .allowBluetooth])
-            try audioSession.setActive(true)
-        } catch {
-            print("Audio session configuration error: \(error)")
+        session.beginConfiguration()
+        
+        // 1080p is required for max gyro overscan and cinematicExtended mode
+        if session.canSetSessionPreset(.hd1920x1080) {
+            session.sessionPreset = .hd1920x1080
         }
 
-        session.beginConfiguration()
-        session.sessionPreset = .high
-
         setupVideoInput(position: currentPosition)
-        setupAudioInput()
 
         if session.canAddOutput(movieOutput) {
             session.addOutput(movieOutput)
         }
         session.commitConfiguration()
+        
         configureStabilization()
         startSession()
     }
@@ -249,16 +231,6 @@ class CameraController: NSObject, ObservableObject, AVCaptureFileOutputRecording
         currentPosition = position
     }
 
-    private func setupAudioInput() {
-        guard activeAudioInput == nil,
-              let audioDevice = AVCaptureDevice.default(for: .audio),
-              let input = try? AVCaptureDeviceInput(device: audioDevice),
-              session.canAddInput(input) else { return }
-
-        session.addInput(input)
-        activeAudioInput = input
-    }
-
     func switchCamera() {
         sessionQueue.async {
             self.session.beginConfiguration()
@@ -270,11 +242,16 @@ class CameraController: NSObject, ObservableObject, AVCaptureFileOutputRecording
 
     func configureStabilization() {
         guard let connection = movieOutput.connection(with: .video) else { return }
+
         if connection.isVideoOrientationSupported {
             connection.videoOrientation = .portrait
         }
+
         if connection.isVideoStabilizationSupported {
             connection.preferredVideoStabilizationMode = .cinematicExtended
+            DispatchQueue.main.async {
+                self.isStabilized = true
+            }
         }
     }
 
@@ -348,8 +325,8 @@ struct PreviewView: View {
             VStack {
                 HStack {
                     Button(action: {
-                        Haptics.shared.tap()
-                        onDismiss()
+                        AppHaptics.tap()
+                        cleanupAndDismiss()
                     }) {
                         Image(systemName: "xmark")
                             .font(.system(size: 18, weight: .bold))
@@ -360,7 +337,7 @@ struct PreviewView: View {
                     }
                     Spacer()
                     Button(action: {
-                        Haptics.shared.tap()
+                        AppHaptics.tap()
                         exportAndSave()
                     }) {
                         Image(systemName: "checkmark")
@@ -402,7 +379,7 @@ struct PreviewView: View {
                 Color.black.opacity(0.7).ignoresSafeArea()
                 VStack(spacing: 14) {
                     ProgressView().tint(.white).scaleEffect(1.4)
-                    Text("Saving to Photos...")
+                    Text("Saving Stabilized Video...")
                         .font(.headline)
                         .foregroundColor(.white)
                 }
@@ -410,6 +387,7 @@ struct PreviewView: View {
         }
         .onAppear {
             let p = AVPlayer(url: videoURL)
+            p.isMuted = true
             self.player = p
 
             let asset = AVAsset(url: videoURL)
@@ -436,6 +414,12 @@ struct PreviewView: View {
         }
     }
 
+    private func cleanupAndDismiss() {
+        player?.pause()
+        player = nil
+        onDismiss()
+    }
+
     private func formatTime(_ seconds: Double) -> String {
         let mins = Int(seconds) / 60
         let secs = Int(seconds) % 60
@@ -460,18 +444,10 @@ struct PreviewView: View {
                 let timeRange = CMTimeRange(start: .zero, duration: duration)
                 let targetDuration = CMTime(value: Int64(Double(duration.value) / speed), timescale: duration.timescale)
 
-                // Insert & scale video track
                 try compVideoTrack.insertTimeRange(timeRange, of: videoTrack, at: .zero)
                 let transform = try await videoTrack.load(.preferredTransform)
                 compVideoTrack.preferredTransform = transform
                 compVideoTrack.scaleTimeRange(timeRange, toDuration: targetDuration)
-
-                // Insert & scale audio track
-                if let audioTrack = try? await asset.loadTracks(withMediaType: .audio).first,
-                   let compAudioTrack = composition.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid) {
-                    try? compAudioTrack.insertTimeRange(timeRange, of: audioTrack, at: .zero)
-                    compAudioTrack.scaleTimeRange(timeRange, toDuration: targetDuration)
-                }
 
                 let outputURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".mp4")
                 guard let session = AVAssetExportSession(asset: composition, presetName: AVAssetExportPresetHighestQuality) else {
@@ -493,7 +469,7 @@ struct PreviewView: View {
                     }
                     DispatchQueue.main.async {
                         isExporting = false
-                        onDismiss()
+                        cleanupAndDismiss()
                     }
                 } else {
                     DispatchQueue.main.async { isExporting = false }
@@ -522,7 +498,6 @@ struct DraggableSpeedSlider: View {
                 Capsule()
                     .fill(Color.black.opacity(0.6))
 
-                // Translucent dots placed with exact matching coordinate steps
                 ForEach(0..<speeds.count, id: \.self) { i in
                     Circle()
                         .fill(Color.white.opacity(0.35))
@@ -530,7 +505,6 @@ struct DraggableSpeedSlider: View {
                         .position(x: padding + (CGFloat(i) * step), y: geometry.size.height / 2)
                 }
 
-                // Speed Thumb
                 Circle()
                     .fill(Color.white)
                     .frame(width: 44, height: 44)
@@ -551,7 +525,7 @@ struct DraggableSpeedSlider: View {
                         let newIndex = Int(round(fraction * CGFloat(speeds.count - 1)))
                         if newIndex != selectedIndex && newIndex >= 0 && newIndex < speeds.count {
                             selectedIndex = newIndex
-                            Haptics.shared.tick()
+                            AppHaptics.tick()
                             onSpeedChanged(speeds[newIndex])
                         }
                     }
